@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+"""
+loop — multi-stage, model-routed TDD agent loop.
+
+Stages: PLAN -> TEST -> IMPLEMENT -> SIMPLIFY -> REVIEW -> (next subtask | DONE)
+
+Each stage runs as a FRESH headless agent process (claude -p / cursor-agent),
+so every stage gets its own model and zero conversation bleed from prior
+stages. State lives on disk in .loop-state/ — stages communicate through
+small structured verdict files, never through the orchestrator's context.
+
+Usage:
+  loop init --goal "..."   Start a new loop (planner runs first)
+  loop run                 Drive stages headlessly until done/blocked
+  loop resume              Clear a blocked status and continue the loop
+  loop close               Archive the current loop to .loop-state/archive/
+  loop spawn <name>        Create a worktree + branch and init a concurrent loop there
+  loop next                Print the current action (for in-session use)
+  loop advance             Apply gates + transition after in-session stage work
+  loop approve-plan        Approve the planner's subtask breakdown
+  loop revise-plan         Reject the current plan and send feedback to the planner
+  loop status              Print current state
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def repo_root() -> Path:
+    r = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+    )
+    return Path(r.stdout.strip()) if r.returncode == 0 else Path.cwd()
+
+
+ROOT = repo_root()
+LOOP_DIR = ROOT / ".loop"
+STATE_DIR = ROOT / ".loop-state"
+VERDICT_DIR = STATE_DIR / "verdicts"
+ARTIFACT_DIR = STATE_DIR / "artifacts"
+STATE_PATH = STATE_DIR / "state.json"
+SUBTASKS_PATH = STATE_DIR / "subtasks.json"
+CONFIG_PATH = LOOP_DIR / "config.json"
+
+STAGE_KEY = {
+    "PLAN": "planner",
+    "TEST": "tester",
+    "IMPLEMENT": "implementor",
+    "SIMPLIFY": "simplifier",
+    "REVIEW": "reviewer",
+}
+
+
+# ---------------------------------------------------------------- state I/O
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def load_json(path: Path, default=None):
+    if path.exists():
+        return json.loads(path.read_text())
+    return default
+
+
+def save_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def load_state() -> dict:
+    state = load_json(STATE_PATH)
+    if state is None:
+        sys.exit("no active loop — run `loop init --goal \"...\"` first")
+    return state
+
+
+def load_config() -> dict:
+    cfg = load_json(CONFIG_PATH)
+    if cfg is None:
+        sys.exit(f"missing config: {CONFIG_PATH}")
+    return cfg
+
+
+def log_event(state: dict, event: str, detail: str = "") -> None:
+    state["history"].append(
+        {
+            "ts": now_iso(),
+            "stage": state.get("stage"),
+            "subtask": state.get("current_subtask"),
+            "event": event,
+            "detail": detail,
+        }
+    )
+
+
+def current_subtask(state: dict):
+    sid = state.get("current_subtask")
+    for st in state.get("subtasks", []):
+        if st["id"] == sid:
+            return st
+    return None
+
+
+def verdict_path(state: dict, stage: str) -> Path:
+    sid = state.get("current_subtask") or "goal"
+    return VERDICT_DIR / f"{sid}-{stage.lower()}.json"
+
+
+# ---------------------------------------------------------------- git helpers
+
+def git_head() -> str:
+    r = subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=ROOT
+    )
+    return r.stdout.strip() if r.returncode == 0 else "HEAD"
+
+
+def snapshot_untracked() -> set:
+    r = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True, cwd=ROOT
+    )
+    return {
+        line[3:].strip().strip('"')
+        for line in r.stdout.splitlines()
+        if line.startswith("?? ")
+    }
+
+
+def new_untracked(sub: dict) -> list:
+    baseline = set(sub.get("baseline_untracked", []))
+    return sorted(
+        p
+        for p in snapshot_untracked()
+        if p not in baseline and not p.startswith(".loop-state/")
+    )
+
+
+def write_diff(state: dict, sub: dict) -> Path:
+    """Diff of this subtask: tracked changes since base_ref + new files.
+
+    Uses `git diff --no-index` for new files so the index is never mutated.
+    """
+    base = sub.get("base_ref") or state.get("base_ref") or "HEAD"
+    parts = []
+    r = subprocess.run(
+        ["git", "diff", base, "--", ".", ":(exclude).loop-state"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    if r.stdout:
+        parts.append(r.stdout)
+    for path in new_untracked(sub):
+        if (ROOT / path).is_file():
+            d = subprocess.run(
+                ["git", "diff", "--no-index", "--", "/dev/null", path],
+                capture_output=True,
+                text=True,
+                cwd=ROOT,
+            )
+            if d.stdout:
+                parts.append(d.stdout)
+    out = ARTIFACT_DIR / f"{sub['id']}-diff.patch"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(parts))
+    return out
+
+
+def commit_subtask(sub: dict, msgs: list) -> None:
+    base = sub.get("base_ref")
+    r = subprocess.run(
+        ["git", "diff", "--name-only", base, "--", ".", ":(exclude).loop-state"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    files = [p for p in r.stdout.splitlines() if p] + new_untracked(sub)
+    if not files:
+        msgs.append("nothing to commit")
+        return
+    subprocess.run(["git", "add", "--"] + files, cwd=ROOT)
+    msg = f"loop: {sub['id']} {sub['title']}"
+    c = subprocess.run(
+        ["git", "commit", "-m", msg], capture_output=True, text=True, cwd=ROOT
+    )
+    msgs.append(
+        f"committed: {msg}" if c.returncode == 0 else f"commit failed: {c.stderr.strip()}"
+    )
+
+
+# ---------------------------------------------------------------- gates
+
+def run_shell(cmd: str, artifact_name: str):
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = ARTIFACT_DIR / artifact_name
+    with out_path.open("w") as f:
+        proc = subprocess.run(
+            cmd, shell=True, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT
+        )
+    return proc.returncode, out_path
+
+
+def block(state: dict, reason: str, msgs: list) -> list:
+    state["status"] = "blocked"
+    log_event(state, "blocked", reason)
+    msgs.append(f"BLOCKED: {reason}")
+    return msgs
+
+
+def begin_next_subtask(state: dict, msgs: list) -> None:
+    pending = [s for s in state["subtasks"] if s["status"] == "pending"]
+    if not pending:
+        state["status"] = "done"
+        state["stage"] = None
+        state["current_subtask"] = None
+        log_event(state, "done", "all subtasks complete")
+        msgs.append("all subtasks complete — loop DONE")
+        return
+    nxt = pending[0]
+    nxt["status"] = "in_progress"
+    nxt["base_ref"] = git_head()
+    nxt["baseline_untracked"] = sorted(snapshot_untracked())
+    state["current_subtask"] = nxt["id"]
+    state["attempts"] = {"test": 0, "implement": 0, "simplify": 0, "review": 0}
+    state["feedback"] = None
+    state["stage"] = "TEST"
+    log_event(state, "subtask_start", nxt["id"])
+    msgs.append(f"-> subtask {nxt['id']}: {nxt['title']} (stage=TEST)")
+
+
+def transition(state: dict, cfg: dict) -> list:
+    """Apply mechanical gates and advance the state machine."""
+    msgs: list = []
+    stage = state["stage"]
+    sub = current_subtask(state)
+
+    if stage == "PLAN":
+        data = load_json(SUBTASKS_PATH)
+        if not data or not data.get("subtasks"):
+            return block(state, f"planner output missing/invalid at {SUBTASKS_PATH}", msgs)
+        state["subtasks"] = [dict(s, status="pending") for s in data["subtasks"]]
+        state["feedback"] = None
+        log_event(state, "plan_written", f"{len(state['subtasks'])} subtasks")
+        if cfg.get("require_plan_approval", True) and not state.get("plan_approved"):
+            state["status"] = "awaiting_plan_approval"
+            msgs.append("plan written — review .loop-state/subtasks.json, then `loop approve-plan`")
+        else:
+            begin_next_subtask(state, msgs)
+        return msgs
+
+    if sub is None:
+        return block(state, "no current subtask", msgs)
+
+    if stage == "TEST":
+        v = load_json(verdict_path(state, "TEST"))
+        if v is None:
+            msgs.append(f"no verdict at {verdict_path(state, 'TEST')} — finish the stage, then re-run")
+            return msgs
+        if v.get("verdict") == "BLOCKED":
+            return block(state, f"tester blocked: {v.get('summary', '')}", msgs)
+        if v.get("test_command"):
+            sub["test_command"] = v["test_command"]
+        test_cmd = sub.get("test_command") or cfg.get("test_command_default")
+        rc, out = run_shell(test_cmd, f"{sub['id']}-test-gate.log")
+        if rc == 0:
+            state["attempts"]["test"] += 1
+            if state["attempts"]["test"] > cfg.get("max_test_attempts", 3):
+                return block(state, "tester produced passing tests repeatedly; tests must fail pre-implementation", msgs)
+            state["feedback"] = (
+                f"The tests you wrote PASS against the current code (output: {out}). "
+                "They must FAIL until the feature is implemented. Tighten them so they "
+                "assert the missing behavior."
+            )
+            log_event(state, "gate_fail", "tests pass pre-implementation; back to TEST")
+            msgs.append("gate: tests already pass — kicking back to TESTER")
+        else:
+            state["attempts"]["test"] = 0
+            state["feedback"] = None
+            state["stage"] = "IMPLEMENT"
+            log_event(state, "gate_pass", "tests fail as required")
+            msgs.append("gate: tests fail as required -> IMPLEMENT")
+        return msgs
+
+    if stage == "IMPLEMENT":
+        v = load_json(verdict_path(state, "IMPLEMENT"))
+        if v and v.get("verdict") == "BLOCKED":
+            return block(state, f"implementor blocked: {v.get('summary', '')}", msgs)
+        test_cmd = sub.get("test_command") or cfg.get("test_command_default")
+        rc, out = run_shell(test_cmd, f"{sub['id']}-implement-gate.log")
+        if rc != 0:
+            state["attempts"]["implement"] += 1
+            if state["attempts"]["implement"] > cfg.get("max_implement_attempts", 3):
+                return block(state, f"tests still failing after {cfg.get('max_implement_attempts', 3)} implement attempts (output: {out})", msgs)
+            state["feedback"] = (
+                f"Tests still FAIL (output: {out}). Read the failures and fix the "
+                "implementation. Do not modify the tests."
+            )
+            log_event(state, "gate_fail", "tests failing; implement retry")
+            msgs.append(f"gate: tests failing — IMPLEMENT retry {state['attempts']['implement']}")
+        else:
+            state["attempts"]["implement"] = 0
+            state["feedback"] = None
+            state["stage"] = "SIMPLIFY"
+            write_diff(state, sub)
+            log_event(state, "gate_pass", "tests green")
+            msgs.append("gate: tests green -> SIMPLIFY")
+        return msgs
+
+    if stage == "SIMPLIFY":
+        v = load_json(verdict_path(state, "SIMPLIFY"))
+        if v is None:
+            msgs.append(f"no verdict at {verdict_path(state, 'SIMPLIFY')} — finish the stage, then re-run")
+            return msgs
+        if v.get("verdict") == "REVISE" and state["attempts"]["simplify"] < cfg.get("max_simplify_cycles", 2):
+            state["attempts"]["simplify"] += 1
+            feedback = "\n".join(f"- {f}" for f in v.get("feedback", []))
+            state["feedback"] = f"The simplification review requested these changes:\n{feedback}"
+            state["stage"] = "IMPLEMENT"
+            log_event(state, "kickback", "simplifier requested changes")
+            msgs.append(f"simplifier: REVISE -> IMPLEMENT (cycle {state['attempts']['simplify']})")
+        else:
+            if v.get("verdict") == "REVISE":
+                msgs.append("simplify cycles exhausted — proceeding to REVIEW anyway")
+            state["feedback"] = None
+            state["stage"] = "REVIEW"
+            write_diff(state, sub)
+            log_event(state, "simplify_done", v.get("verdict", ""))
+            msgs.append("-> REVIEW")
+        return msgs
+
+    if stage == "REVIEW":
+        v = load_json(verdict_path(state, "REVIEW"))
+        if v is None:
+            msgs.append(f"no verdict at {verdict_path(state, 'REVIEW')} — finish the stage, then re-run")
+            return msgs
+        if v.get("verdict") == "REQUEST_CHANGES" and state["attempts"]["review"] < cfg.get("max_review_cycles", 2):
+            state["attempts"]["review"] += 1
+            findings = "\n".join(
+                f"- [{f.get('severity', '?')}] {f.get('location', '?')}: {f.get('issue', '')} "
+                f"(suggestion: {f.get('suggestion', '')})"
+                for f in v.get("findings", [])
+            )
+            state["feedback"] = f"The reviewer requested changes:\n{findings}"
+            state["stage"] = "IMPLEMENT"
+            log_event(state, "kickback", "reviewer requested changes")
+            msgs.append(f"reviewer: REQUEST_CHANGES -> IMPLEMENT (cycle {state['attempts']['review']})")
+        else:
+            if v.get("verdict") == "REQUEST_CHANGES":
+                msgs.append("review cycles exhausted — accepting with open findings")
+            sub["status"] = "done"
+            sub["review_summary"] = v.get("summary", "")
+            log_event(state, "subtask_done", sub["id"])
+            msgs.append(f"subtask {sub['id']} approved")
+            if cfg.get("commit_per_subtask", False):
+                commit_subtask(sub, msgs)
+            begin_next_subtask(state, msgs)
+        return msgs
+
+    return block(state, f"unknown stage {stage}", msgs)
+
+
+# ---------------------------------------------------------------- prompt + spawn
+
+def render_prompt(state: dict, cfg: dict, stage: str) -> str:
+    template = (LOOP_DIR / "stages" / f"{STAGE_KEY[stage]}.md").read_text()
+    sub = current_subtask(state) or {}
+    sid = sub.get("id", "goal")
+    context_parts = []
+    jira = (state.get("context") or {}).get("jira")
+    if jira:
+        context_parts.append(
+            f"Jira ticket: {jira}\n"
+            "Fetch it with your Atlassian/Jira tools and treat its description and "
+            "acceptance criteria as primary context for the goal."
+        )
+    extra = (state.get("context") or {}).get("extra")
+    if extra:
+        context_parts.append(extra)
+    replacements = {
+        "{{GOAL}}": state["goal"],
+        "{{EXTRA_CONTEXT}}": "\n\n".join(context_parts),
+        "{{SUBTASK_ID}}": sub.get("id", ""),
+        "{{SUBTASK_TITLE}}": sub.get("title", ""),
+        "{{SUBTASK_SPEC}}": sub.get("spec", ""),
+        "{{ACCEPTANCE_CRITERIA}}": "\n".join(
+            f"- {c}" for c in sub.get("acceptance_criteria", [])
+        ),
+        "{{TEST_COMMAND}}": sub.get("test_command") or cfg.get("test_command_default", ""),
+        "{{FEEDBACK}}": state.get("feedback") or "",
+        "{{VERDICT_PATH}}": str(verdict_path(state, stage)),
+        "{{SUBTASKS_PATH}}": str(SUBTASKS_PATH),
+        "{{DIFF_PATH}}": str(ARTIFACT_DIR / f"{sid}-diff.patch"),
+        "{{REPO_ROOT}}": str(ROOT),
+    }
+    for k, v in replacements.items():
+        template = template.replace(k, v)
+    return template
+
+
+def spawn_stage(state: dict, cfg: dict, stage: str):
+    """Run one stage as a fresh headless agent process. Returns (ok, error)."""
+    key = STAGE_KEY[stage]
+    runtime = cfg["runtime"]
+    stage_cfg = cfg["stages"][key]
+    model = stage_cfg["models"][runtime]
+    prompt = render_prompt(state, cfg, stage)
+    cmd = [
+        part.replace("{model}", model).replace("{prompt}", prompt)
+        for part in cfg["runtimes"][runtime]
+    ]
+    effort = (stage_cfg.get("effort") or {}).get(runtime)
+    if effort:
+        cmd += ["--effort", effort]
+    timeout = cfg.get("stage_timeout_seconds", 2400)
+    print(f"[loop] stage={stage} runtime={runtime} model={model}" + (f" effort={effort}" if effort else ""))
+    try:
+        proc = subprocess.run(cmd, cwd=ROOT, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"stage timed out after {timeout}s"
+    except FileNotFoundError:
+        return False, f"agent CLI not found: {cmd[0]}"
+    if proc.returncode != 0:
+        return False, f"agent CLI exited {proc.returncode}"
+    if stage == "PLAN":
+        if not SUBTASKS_PATH.exists():
+            return False, f"planner did not write {SUBTASKS_PATH}"
+    elif not verdict_path(state, stage).exists():
+        return False, f"stage did not write verdict to {verdict_path(state, stage)}"
+    return True, ""
+
+
+def notify(cfg: dict, title: str, message: str) -> None:
+    if not cfg.get("notify_on_finish", True):
+        return
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{message}" with title "{title}" sound name "Glass"',
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(args) -> None:
+    if STATE_PATH.exists() and not args.force:
+        sys.exit("a loop is already active — run `loop close` to archive it first (or --force to discard it)")
+    for d in (VERDICT_DIR, ARTIFACT_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    SUBTASKS_PATH.unlink(missing_ok=True)
+    extra_context = args.context or ""
+    if args.context_file:
+        extra_context += "\n\n" + Path(args.context_file).read_text()
+    state = {
+        "id": f"loop-{int(time.time())}",
+        "goal": args.goal,
+        "context": {
+            "jira": args.jira,
+            "extra": extra_context.strip(),
+        },
+        "status": "running",
+        "stage": "PLAN",
+        "plan_approved": False,
+        "subtasks": [],
+        "current_subtask": None,
+        "attempts": {"test": 0, "implement": 0, "simplify": 0, "review": 0},
+        "feedback": None,
+        "base_ref": git_head(),
+        "created": now_iso(),
+        "history": [],
+    }
+    log_event(state, "init", args.goal)
+    save_json(STATE_PATH, state)
+    print(f"loop initialized: {args.goal}")
+    print("next: `loop run` (headless) or `loop next` (in-session)")
+
+
+def cmd_next(args) -> None:
+    state = load_state()
+    cfg = load_config()
+    print(f"status={state['status']}")
+    if state["status"] != "running":
+        return
+    stage = state["stage"]
+    sub = current_subtask(state) or {}
+    key = STAGE_KEY[stage]
+    print(f"action={stage}")
+    print(f"skill={key}")
+    print(f"model={cfg['stages'][key]['models'][cfg['runtime']]}")
+    effort = (cfg["stages"][key].get("effort") or {}).get(cfg["runtime"])
+    if effort:
+        print(f"effort={effort}")
+    if sub:
+        print(f"subtask={sub['id']}")
+        print(f"title={sub.get('title', '')}")
+        print(f"spec={sub.get('spec', '')}")
+        print(f"test_command={sub.get('test_command') or cfg.get('test_command_default', '')}")
+        print(f"verdict_path={verdict_path(state, stage)}")
+    if state.get("feedback"):
+        print(f"feedback={state['feedback']}")
+    print(f"prompt={LOOP_DIR / 'stages' / (key + '.md')}")
+
+
+def cmd_advance(args) -> None:
+    state = load_state()
+    cfg = load_config()
+    if state["status"] != "running":
+        sys.exit(f"loop is {state['status']} — nothing to advance")
+    msgs = transition(state, cfg)
+    save_json(STATE_PATH, state)
+    for m in msgs:
+        print(m)
+
+
+def cmd_approve_plan(args) -> None:
+    state = load_state()
+    cfg = load_config()
+    if state["status"] != "awaiting_plan_approval":
+        sys.exit(f"loop is {state['status']} — no plan awaiting approval")
+    state["plan_approved"] = True
+    state["status"] = "running"
+    log_event(state, "plan_approved")
+    msgs: list = []
+    begin_next_subtask(state, msgs)
+    save_json(STATE_PATH, state)
+    for m in msgs:
+        print(m)
+
+
+def cmd_revise_plan(args) -> None:
+    state = load_state()
+    if state["status"] != "awaiting_plan_approval":
+        sys.exit(
+            f"loop is {state['status']} — plan changes can only be requested "
+            "while awaiting plan approval"
+        )
+    feedback = args.feedback or ""
+    if args.feedback_file:
+        feedback += "\n\n" + Path(args.feedback_file).read_text()
+    feedback = feedback.strip()
+    if not feedback:
+        sys.exit("provide --feedback or --feedback-file")
+
+    revision = state.get("plan_revision", 0) + 1
+    archive_path = ARTIFACT_DIR / f"plan-revision-{revision}.json"
+    save_json(
+        archive_path,
+        {
+            "revision": revision,
+            "feedback": feedback,
+            "rejected_plan": load_json(SUBTASKS_PATH, {"subtasks": state["subtasks"]}),
+        },
+    )
+    state["plan_revision"] = revision
+    state["plan_approved"] = False
+    state["subtasks"] = []
+    state["current_subtask"] = None
+    state["status"] = "running"
+    state["stage"] = "PLAN"
+    state["feedback"] = (
+        f"PLAN REVISION {revision} REQUESTED BY THE USER:\n{feedback}\n\n"
+        "Replace the previous plan with a revised plan that addresses this feedback."
+    )
+    SUBTASKS_PATH.unlink(missing_ok=True)
+    log_event(state, "plan_revision_requested", feedback)
+    save_json(STATE_PATH, state)
+    print(f"plan rejected; previous plan archived to {archive_path}")
+    print("next: `loop run` to generate the revised plan")
+
+
+PID_PATH = STATE_DIR / "run.pid"
+
+
+def cmd_run(args) -> None:
+    state = load_state()
+    cfg = load_config()
+    if state["status"] == "awaiting_plan_approval":
+        sys.exit("plan awaiting approval — run `loop approve-plan` first")
+    if state["status"] != "running":
+        sys.exit(f"loop is {state['status']}")
+    PID_PATH.write_text(str(os.getpid()))
+    try:
+        _run_loop(state, cfg)
+    finally:
+        PID_PATH.unlink(missing_ok=True)
+
+
+def _run_loop(state: dict, cfg: dict) -> None:
+    max_iter = cfg.get("max_iterations", 60)
+    for i in range(1, max_iter + 1):
+        if state["status"] != "running":
+            break
+        stage = state["stage"]
+        print(f"\n[loop] iteration {i}/{max_iter}")
+        verdict_path(state, stage).unlink(missing_ok=True)
+        ok, err = spawn_stage(state, cfg, stage)
+        if not ok:
+            # one retry with the error fed back into the prompt
+            state["feedback"] = (
+                f"Your previous attempt failed: {err}. "
+                "You MUST write your output file exactly where instructed."
+            )
+            verdict_path(state, stage).unlink(missing_ok=True)
+            ok, err = spawn_stage(state, cfg, stage)
+            if not ok:
+                state["status"] = "blocked"
+                log_event(state, "blocked", err)
+                save_json(STATE_PATH, state)
+                notify(cfg, "Loop blocked", f"{state['goal'][:80]} — {err[:120]}")
+                sys.exit(f"BLOCKED: {err}")
+        msgs = transition(state, cfg)
+        save_json(STATE_PATH, state)
+        for m in msgs:
+            print(f"[loop] {m}")
+        if state["status"] == "awaiting_plan_approval":
+            print("\n[loop] subtasks:")
+            for s in state["subtasks"]:
+                print(f"  {s['id']}: {s['title']}")
+            print("[loop] review .loop-state/subtasks.json, then `loop approve-plan` && `loop run`")
+            notify(cfg, "Loop plan ready", f"{state['goal'][:80]} — awaiting approval")
+            return
+    else:
+        state["status"] = "blocked"
+        log_event(state, "blocked", f"exceeded max_iterations={max_iter}")
+        save_json(STATE_PATH, state)
+        notify(cfg, "Loop blocked", f"{state['goal'][:80]} — exceeded max_iterations")
+        sys.exit(f"BLOCKED: exceeded max_iterations={max_iter}")
+    print(f"\n[loop] finished with status={state['status']}")
+    if state["status"] == "done":
+        notify(cfg, "Loop done", state["goal"][:120])
+    elif state["status"] == "blocked":
+        notify(cfg, "Loop blocked", state["goal"][:120])
+
+
+def cmd_resume(args) -> None:
+    state = load_state()
+    if state["status"] not in ("blocked",):
+        sys.exit(f"loop is {state['status']} — only a blocked loop can be resumed")
+    state["status"] = "running"
+    state["feedback"] = None
+    log_event(state, "resumed", args.reason or "")
+    save_json(STATE_PATH, state)
+    print(f"resumed at stage={state['stage']} subtask={state.get('current_subtask')}")
+    print("next: `loop run`")
+
+
+def runner_alive() -> bool:
+    if not PID_PATH.exists():
+        return False
+    try:
+        os.kill(int(PID_PATH.read_text().strip()), 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+
+
+def cmd_context(args) -> None:
+    state = load_state()
+    if state.get("stage") != "PLAN" or state.get("subtasks"):
+        sys.exit("context can only be set before planning completes")
+    ctx = state.setdefault("context", {})
+    if args.jira:
+        ctx["jira"] = args.jira
+    if args.context:
+        ctx["extra"] = ((ctx.get("extra") or "") + "\n\n" + args.context).strip()
+    if args.context_file:
+        ctx["extra"] = ((ctx.get("extra") or "") + "\n\n" + Path(args.context_file).read_text()).strip()
+    log_event(state, "context_updated", args.jira or "extra context")
+    save_json(STATE_PATH, state)
+    print(f"context updated: jira={ctx.get('jira')} extra={'yes' if ctx.get('extra') else 'no'}")
+
+
+def cmd_spawn(args) -> None:
+    branch = args.branch or f"loop/{args.name}"
+    wt_path = Path(args.dir) if args.dir else ROOT.parent / f"{ROOT.name}-{args.name}"
+    if wt_path.exists():
+        sys.exit(f"worktree path already exists: {wt_path}")
+
+    cmd = ["git", "worktree", "add", str(wt_path), "-b", branch, args.base]
+    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"git worktree add failed: {r.stderr.strip()}")
+    print(f"worktree: {wt_path} (branch {branch}, base {args.base})")
+
+    shutil.copytree(LOOP_DIR, wt_path / ".loop")
+
+    if args.runtime:
+        wt_cfg_path = wt_path / ".loop" / "config.json"
+        wt_cfg = load_json(wt_cfg_path)
+        if args.runtime not in wt_cfg.get("runtimes", {}):
+            sys.exit(f"unknown runtime '{args.runtime}' — known: {', '.join(wt_cfg.get('runtimes', {}))}")
+        wt_cfg["runtime"] = args.runtime
+        save_json(wt_cfg_path, wt_cfg)
+        print(f"runtime override: {args.runtime}")
+
+    init_cmd = [str(wt_path / ".loop" / "bin" / "loop"), "init", "--goal", args.goal]
+    if args.jira:
+        init_cmd += ["--jira", args.jira]
+    if args.context:
+        init_cmd += ["--context", args.context]
+    if args.context_file:
+        init_cmd += ["--context-file", str(Path(args.context_file).resolve())]
+    r = subprocess.run(init_cmd, cwd=wt_path)
+    if r.returncode != 0:
+        sys.exit("worktree created but loop init failed — check the worktree manually")
+
+    print(f"\nto start:")
+    print(f"  cd {wt_path}")
+    print(f"  .loop/bin/loop run")
+
+
+def cmd_close(args) -> None:
+    state = load_state()
+    if runner_alive():
+        sys.exit("a `loop run` process is still active — stop it before closing")
+    state["closed_at"] = now_iso()
+    log_event(state, "closed", args.reason or "")
+    archive_dir = STATE_DIR / "archive" / state["id"]
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    save_json(archive_dir / "state.json", state)
+    for path in (SUBTASKS_PATH,):
+        if path.exists():
+            path.rename(archive_dir / path.name)
+    for d in (VERDICT_DIR, ARTIFACT_DIR):
+        if d.exists():
+            for f in d.iterdir():
+                if f.is_file():
+                    f.rename(archive_dir / f.name)
+    STATE_PATH.unlink()
+    PID_PATH.unlink(missing_ok=True)
+    print(f"loop {state['id']} closed (final status: {state['status']})")
+    print(f"archived to {archive_dir}")
+
+
+def cmd_status(args) -> None:
+    state = load_state()
+    live = runner_alive()
+    print(f"id={state['id']} status={state['status']} stage={state.get('stage')} runner={'live' if live else 'not running'}")
+    if state["status"] == "running" and not live:
+        print("NOTE: state says running but no `loop run` process is active — run `loop run` to continue")
+    print(f"goal={state['goal']}")
+    for s in state.get("subtasks", []):
+        marker = "->" if s["id"] == state.get("current_subtask") else "  "
+        print(f"{marker} {s['id']} [{s['status']}] {s['title']}")
+    if state.get("feedback"):
+        print(f"feedback={state['feedback']}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="loop", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init")
+    p.add_argument("--goal", required=True)
+    p.add_argument("--jira", help="Jira ticket key (e.g. EC-1234); the planner fetches it via its Atlassian tools")
+    p.add_argument("--context", help="extra context string injected into the planner prompt")
+    p.add_argument("--context-file", help="path to a file whose contents are injected into the planner prompt")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_init)
+
+    sub.add_parser("next").set_defaults(fn=cmd_next)
+    sub.add_parser("advance").set_defaults(fn=cmd_advance)
+    sub.add_parser("approve-plan").set_defaults(fn=cmd_approve_plan)
+
+    p = sub.add_parser("revise-plan")
+    p.add_argument("--feedback", help="changes the revised plan must address")
+    p.add_argument("--feedback-file", help="file containing detailed plan feedback")
+    p.set_defaults(fn=cmd_revise_plan)
+
+    sub.add_parser("run").set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("resume")
+    p.add_argument("--reason", default="")
+    p.set_defaults(fn=cmd_resume)
+
+    p = sub.add_parser("context")
+    p.add_argument("--jira")
+    p.add_argument("--context")
+    p.add_argument("--context-file")
+    p.set_defaults(fn=cmd_context)
+
+    p = sub.add_parser("close")
+    p.add_argument("--reason", default="")
+    p.set_defaults(fn=cmd_close)
+
+    p = sub.add_parser("spawn")
+    p.add_argument("name", help="loop name; worktree created at ../<repo>-<name>")
+    p.add_argument("--goal", required=True)
+    p.add_argument("--branch", help="branch name (default: loop/<name>)")
+    p.add_argument("--base", default="HEAD", help="git ref to branch from (default: HEAD)")
+    p.add_argument("--dir", help="custom worktree path (default: ../<repo>-<name>)")
+    p.add_argument("--runtime", help="agent runtime for this loop (e.g. claude, cursor); overrides config.json in the worktree only")
+    p.add_argument("--jira")
+    p.add_argument("--context")
+    p.add_argument("--context-file")
+    p.set_defaults(fn=cmd_spawn)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+
+    args = parser.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

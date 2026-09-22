@@ -1,0 +1,25 @@
+{
+  "version": "0.1.0",
+  "runtime": "cursor",
+  "runtimes": {
+    "claude": ["claude", "-p", "{prompt}", "--model", "{model}", "--allowedTools", "Read,Write,Edit,Bash,Grep,Glob"],
+    "cursor": ["cursor-agent", "-p", "{prompt}", "--model", "{model}", "--force"]
+  },
+  "stages": {
+    "planner":     { "models": { "claude": "sonnet", "cursor": "kimi-k3-high" }, "effort": { "claude": "high" } },
+    "tester":      { "models": { "claude": "haiku", "cursor": "composer-2.5" } },
+    "implementor": { "models": { "claude": "haiku", "cursor": "composer-2.5" } },
+    "simplifier":  { "models": { "claude": "haiku", "cursor": "composer-2.5" } },
+    "reviewer":    { "models": { "claude": "sonnet", "cursor": "cursor-grok-4.6-high" }, "effort": { "claude": "medium" } }
+  },
+  "test_command_default": "make phpunit",
+  "require_plan_approval": true,
+  "notify_on_finish": true,
+  "commit_per_subtask": false,
+  "max_test_attempts": 3,
+  "max_implement_attempts": 3,
+  "max_simplify_cycles": 2,
+  "max_review_cycles": 2,
+  "max_iterations": 60,
+  "stage_timeout_seconds": 2400
+}
